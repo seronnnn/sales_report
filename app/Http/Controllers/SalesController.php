@@ -169,7 +169,7 @@ class SalesController extends Controller
      * appears in the master list immediately.
      *
      * POST /master/material/store
-     * Body: { material_id, material, dc, division }
+     * Body: { material_id, material }
      */
     public function storeMaterial(Request $request)
     {
@@ -177,8 +177,6 @@ class SalesController extends Controller
             $data = $request->validate([
                 'material_id' => 'required|string|max:100',
                 'material'    => 'required|string|max:255',
-                'dc'          => 'nullable|string|max:50',
-                'division'    => 'nullable|string|max:100',
             ]);
 
             // Prevent duplicate material_id
@@ -196,21 +194,8 @@ class SalesController extends Controller
             $newId = (DB::table('sales_report')->max('id') ?? 0) + 1;
 
             DB::table('sales_report')->insert([
-                'id'               => $newId,
                 'material_id'      => trim($data['material_id']),
                 'material'         => trim($data['material']),
-                'dc'               => isset($data['dc'])       ? trim($data['dc'])       : null,
-                'division'         => isset($data['division'])  ? trim($data['division'])  : null,
-                // All financial fields default to 0 for a placeholder row
-                'qty'              => 0,
-                'gross_revenue'    => 0,
-                'logistic_expense' => 0,
-                'net_revenue'      => 0,
-                'cogs'             => 0,
-                'gross_gp'         => 0,
-                'gross_gm_percent' => 0,
-                'created_at'       => now(),
-                'updated_at'       => now(),
             ]);
 
             return response()->json(['success' => true, 'message' => 'Material added successfully.']);
@@ -224,29 +209,23 @@ class SalesController extends Controller
 
     /**
      * Update an existing Master Material entry.
-     * Updates material description, DC, and division for ALL rows
-     * that share the given material_id so the change is consistent
-     * across all transaction records.
+     * Updates material description for ALL rows that share the given 
+     * material_id so the change is consistent across all transaction records.
      *
      * PUT /master/material/{id}
-     * Body: { material, dc, division }
+     * Body: { material }
      */
     public function updateMaterial(Request $request, $id)
     {
         try {
             $data = $request->validate([
                 'material' => 'required|string|max:255',
-                'dc'       => 'nullable|string|max:50',
-                'division' => 'nullable|string|max:100',
             ]);
 
             $affected = DB::table('sales_report')
                 ->where('material_id', $id)
                 ->update([
                     'material'   => trim($data['material']),
-                    'dc'         => isset($data['dc'])       ? trim($data['dc'])       : null,
-                    'division'   => isset($data['division'])  ? trim($data['division'])  : null,
-                    'updated_at' => now(),
                 ]);
 
             if ($affected === 0) {
@@ -284,58 +263,68 @@ class SalesController extends Controller
      * GET /sales/master-salesman
      */
     public function getMasterSalesman(Request $request)
-    {
-        try {
-            $rows = DB::table('sales_report')
-                ->select(
-                    'salesman_id',
-                    'salesman',
-                    'customer',
-                    'material',
-                    DB::raw('SUM(qty)              AS total_qty'),
-                    DB::raw('SUM(gross_revenue)    AS total_gross_revenue'),
-                    DB::raw('SUM(net_revenue)      AS total_net_revenue'),
-                    DB::raw('SUM(logistic_expense) AS total_logistic_expense'),
-                    DB::raw('SUM(cogs)             AS total_cogs'),
-                    DB::raw('SUM(gross_gp)         AS total_gross_gp')
-                )
-                ->whereNotNull('salesman_id')
-                ->where('salesman_id', '!=', '')
-                ->groupBy('salesman_id', 'salesman', 'customer', 'material')
-                ->orderBy('salesman_id')
-                ->orderBy('customer')
-                ->get();
+{
+    try {
+        // Step 1: get all raw rows per salesman (not grouped by customer/material)
+        $rawRows = DB::table('sales_report')
+            ->select(
+                'salesman_id', 'salesman', 'customer', 'material',
+                'qty', 'gross_revenue', 'net_revenue',
+                'logistic_expense', 'cogs', 'gross_gp', 'month_num'
+            )
+            ->whereNotNull('salesman_id')
+            ->where('salesman_id', '!=', '')
+            ->orderBy('salesman_id')
+            ->get();
 
-            $result = $rows->map(function ($r) {
-                $rev = (float) ($r->total_gross_revenue ?? 0);
-                $gp  = (float) ($r->total_gross_gp ?? 0);
-                $gm  = $rev > 0 ? round($gp / $rev * 100, 4) : 0;
-
-                return [
-                    'salesman_id'            => $r->salesman_id,
-                    'salesman'               => $r->salesman ?? '—',
-                    'customer'               => $r->customer ?? '—',
-                    'material'               => $r->material ?? '—',
-                    'total_qty'              => (float) ($r->total_qty ?? 0),
-                    'total_gross_revenue'    => $rev,
-                    'total_net_revenue'      => (float) ($r->total_net_revenue ?? 0),
-                    'total_logistic_expense' => (float) ($r->total_logistic_expense ?? 0),
-                    'total_cogs'             => (float) ($r->total_cogs ?? 0),
-                    'total_gross_gp'         => $gp,
-                    'gross_gm_percent'       => $gm,
+        // Step 2: group by salesman_id, aggregate totals, collect detail rows
+        $grouped = [];
+        foreach ($rawRows as $r) {
+            $sid = $r->salesman_id;
+            if (!isset($grouped[$sid])) {
+                $grouped[$sid] = [
+                    'salesman_id'      => $sid,
+                    'salesman'         => $r->salesman ?? '—',
+                    'qty'              => 0,
+                    'gross_revenue'    => 0,
+                    'net_revenue'      => 0,
+                    'logistic_expense' => 0,
+                    'cogs'             => 0,
+                    'gross_gp'         => 0,
+                    'rows'             => [],
                 ];
-            });
-
-            return response()->json([
-                'success' => true,
-                'total'   => $result->count(),
-                'data'    => $result,
-            ]);
-
-        } catch (\Throwable $e) {
-            return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+            }
+            $grouped[$sid]['qty']              += (float)($r->qty ?? 0);
+            $grouped[$sid]['gross_revenue']    += (float)($r->gross_revenue ?? 0);
+            $grouped[$sid]['net_revenue']      += (float)($r->net_revenue ?? 0);
+            $grouped[$sid]['logistic_expense'] += (float)($r->logistic_expense ?? 0);
+            $grouped[$sid]['cogs']             += (float)($r->cogs ?? 0);
+            $grouped[$sid]['gross_gp']         += (float)($r->gross_gp ?? 0);
+            $grouped[$sid]['rows'][]            = [
+                'customer'      => $r->customer,
+                'material'      => $r->material,
+                'qty'           => (float)($r->qty ?? 0),
+                'gross_revenue' => (float)($r->gross_revenue ?? 0),
+                'net_revenue'   => (float)($r->net_revenue ?? 0),
+                'cogs'          => (float)($r->cogs ?? 0),
+                'gross_gp'      => (float)($r->gross_gp ?? 0),
+                'month_num'     => $r->month_num,
+            ];
         }
+
+        $result = array_values(array_map(function ($s) {
+            $rev = $s['gross_revenue'];
+            $gp  = $s['gross_gp'];
+            $s['gross_gm_percent'] = $rev > 0 ? round($gp / $rev * 100, 4) : 0;
+            return $s;
+        }, $grouped));
+
+        return response()->json(['success' => true, 'total' => count($result), 'data' => $result]);
+
+    } catch (\Throwable $e) {
+        return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
     }
+}
 
     /**
      * Store a new Master Salesman entry.
@@ -379,8 +368,6 @@ class SalesController extends Controller
                 'cogs'             => 0,
                 'gross_gp'         => 0,
                 'gross_gm_percent' => 0,
-                'created_at'       => now(),
-                'updated_at'       => now(),
             ]);
 
             return response()->json(['success' => true, 'message' => 'Salesman added successfully.']);
@@ -411,7 +398,6 @@ class SalesController extends Controller
                 ->where('salesman_id', $id)
                 ->update([
                     'salesman'   => trim($data['salesman']),
-                    'updated_at' => now(),
                 ]);
 
             if ($affected === 0) {
